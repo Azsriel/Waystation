@@ -1,4 +1,5 @@
 ﻿using System;
+using TMPro;
 using UnityEngine;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
@@ -70,17 +71,29 @@ namespace StarterAssets
         // cinemachine
         private float _cinemachineTargetPitch;
 
+        //State Machines
+        enum MovementState
+        {
+            Grounded,
+            Falling,
+            Dashing,
+            Walling,
+        }
+
         // player
         private float _speed;
         private float _rotationVelocity;
         private float _verticalVelocity;
         private float _horizontalVelocity;
         private float _terminalVelocity = 53.0f;
+        private float _prevSpeed;
+        private Vector3 _prevDirection;
+        private Vector3 _currentDirection;
 
-        private Collider[] _walls = new Collider[8];
+        private MovementState _currentMovementState = MovementState.Grounded;
 
         //Booleans
-        private bool _isDashing = false;
+        private bool _wallJumping = false;
 
         private int currentNumberOfWallJumps = 0;
 
@@ -90,6 +103,9 @@ namespace StarterAssets
         private float _jumpTimeoutDelta;
         private float _fallTimeoutDelta;
         private float _wallRunDelta;
+
+
+
 
 
 #if ENABLE_INPUT_SYSTEM
@@ -139,9 +155,11 @@ namespace StarterAssets
 
         private void Update()
         {
+            UpdateCooldowns();
             JumpAndGravity();
-            GroundedCheck();
-            Move();
+            HorizontalMove();
+
+            MoveThePlayer(_currentDirection);
         }
 
         private void LateUpdate()
@@ -149,21 +167,35 @@ namespace StarterAssets
             CameraRotation();
         }
 
-        private void GroundedCheck()
+        private void UpdateStates()
         {
+            //RETENTION CHECKS
+            //Still dashing
+            if (_dashDurationDelta <= DashDuration)
+                return;
+
+
+            //TRANSITION CHECKS
             // set sphere position, with offset
             Vector3 spherePosition = new Vector3(transform.position.x, transform.position.y - GroundedOffset, transform.position.z);
-            Grounded = Physics.CheckSphere(spherePosition, GroundedRadius, GroundLayers, QueryTriggerInteraction.Ignore);
+            //GroundCheck
+            if (Physics.CheckSphere(spherePosition, GroundedRadius, GroundLayers, QueryTriggerInteraction.Ignore))
+                _currentMovementState = MovementState.Grounded;
 
             //Wall Check
-            if (!Grounded)
+            else if (_currentMovementState != MovementState.Walling || _currentMovementState != MovementState.Grounded)
             {
-                Walled = Physics.CheckSphere(spherePosition + new Vector3(0, 1f, 0), GroundedRadius + 0.1f, GroundLayers, QueryTriggerInteraction.Ignore);
+                if (Physics.CheckSphere(spherePosition + new Vector3(0, 1f, 0), GroundedRadius + 0.1f, GroundLayers, QueryTriggerInteraction.Ignore))
+                    _currentMovementState = MovementState.Walling;
             }
-            if (Walled && Grounded)
-            {
-                Walled = false;
-            }
+
+            //Dash Check
+            else if (_input.dash && _dashTimeoutDelta <= 0.0f)
+                _currentMovementState = MovementState.Dashing;
+
+            //Falling State
+            else
+                _currentMovementState = MovementState.Falling;
         }
 
         private void CameraRotation()
@@ -188,43 +220,60 @@ namespace StarterAssets
             }
         }
 
-        private void Move()
+        private void UpdateCooldowns()
         {
-            if (Walled)
-            {
-                HandleWalledMovement();
-                return;
-            }
-
-            if ((_input.dash && _dashTimeoutDelta <= 0.0f) || _isDashing)
-                Dash();
             if (_dashTimeoutDelta >= 0.0f)
                 _dashTimeoutDelta -= Time.deltaTime;
 
-            // set target speed based on move speed, sprint speed and if sprint is pressed
-            float targetSpeed = MoveSpeed;
-            //Reduce Horizontal Speed if in the air
-            if (!Grounded)
-                targetSpeed *= AirSpeedMultiplier;
+            if (_jumpTimeoutDelta >= 0.0f)
+                _jumpTimeoutDelta -= Time.deltaTime;
+        }
 
-            // a simplistic acceleration and deceleration designed to be easy to remove, replace, or iterate upon
+        private void HorizontalMove()
+        {
+            //Update the states
+            UpdateStates();
 
-            // note: Vector2's == operator uses approximation so is not floating point error prone, and is cheaper than magnitude
-            // if there is no input, set the target speed to 0
+            //Handle the movement based on the current state
+            Vector3 inputDirection = Vector3.zero;
+            switch (_currentMovementState)
+            {
+                case MovementState.Grounded:
+                    _currentDirection = HandleGroundHoriMovement();
+                    break;
+                case MovementState.Walling:
+                    _currentDirection = HandleWalledHoriMovement();
+                    break;
+                case MovementState.Falling:
+                    _currentDirection = HandleFallingHoriMovement();
+                    break;
+                case MovementState.Dashing:
+                    _dashTimeoutDelta = DashCooldown;
+                    _dashDurationDelta = 0f;
+                    _currentDirection = HandleDashHoriMovement();
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        private Vector3 GeneralHorizontalMovement(float targetSpeed)
+        {
             if (_input.move == Vector2.zero) targetSpeed = 0.0f;
 
-            // a reference to the players current horizontal velocity
+            //Get reference to current player speed
             float currentHorizontalSpeed = new Vector3(_controller.velocity.x, 0.0f, _controller.velocity.z).magnitude;
             float speedOffset = 0.1f;
             float inputMagnitude = _input.analogMovement ? _input.move.magnitude : 1f;
 
+            //Small bit of hard coding for dashing
+            float speedChangeRate = _currentMovementState == MovementState.Dashing ? SpeedChangeRate * 100 : SpeedChangeRate;
+
             // accelerate or decelerate to target speed
             if (currentHorizontalSpeed < targetSpeed - speedOffset || currentHorizontalSpeed > targetSpeed + speedOffset)
             {
-                // creates curved result rather than a linear one giving a more organic speed change
-                // note T in Lerp is clamped, so we don't need to clamp our speed
-                _speed = Mathf.Lerp(currentHorizontalSpeed, targetSpeed * inputMagnitude, Time.deltaTime * SpeedChangeRate);
-
+                //Lerp
+                _speed = Mathf.Lerp(currentHorizontalSpeed, targetSpeed * inputMagnitude, Time.deltaTime * speedChangeRate);
                 // round speed to 3 decimal places
                 _speed = Mathf.Round(_speed * 1000f) / 1000f;
             }
@@ -233,29 +282,31 @@ namespace StarterAssets
                 _speed = targetSpeed;
             }
 
-            // normalise input direction
+            // Get normalized input direction
             Vector3 inputDirection = new Vector3(_input.move.x, 0.0f, _input.move.y).normalized;
-
-            // note: Vector2's != operator uses approximation so is not floating point error prone, and is cheaper than magnitude
-            // if there is a move input rotate player when the player is moving
             if (_input.move != Vector2.zero)
             {
-                // move
                 inputDirection = transform.right * _input.move.x + transform.forward * _input.move.y;
             }
 
-            // move the player
-            MoveThePlayer(inputDirection.normalized);
+            return inputDirection;
         }
 
-        private void HandleWalledMovement()
+        private Vector3 HandleGroundHoriMovement()
         {
+            //Set target speed
+            float targetSpeed = MoveSpeed;
+            return GeneralHorizontalMovement(MoveSpeed);
 
-            if (_jumpTimeoutDelta >= 0.0f)
+        }
+        private Vector3 HandleWalledHoriMovement()
+        {
+            //Retention of Wall Jumping state
+            if (_wallJumping)
             {
-                _jumpTimeoutDelta -= Time.deltaTime;
+                return _prevDirection;
             }
-
+            //Initializing WallJump state
             Vector3 inputDirection = Vector3.zero;
             if (_input.jump && _jumpTimeoutDelta <= 0.0f && currentNumberOfWallJumps < WallJumpNumber)
             {
@@ -274,14 +325,27 @@ namespace StarterAssets
                         break;
                     }
                 }
-                _speed = MoveSpeed;
-                _verticalVelocity = Mathf.Sqrt(JumpHeight * -2f * Gravity);
+                float targetSpeed = MoveSpeed;
                 currentNumberOfWallJumps++;
                 _input.jump = false;
+
+                float currentHorizontalSpeed = new Vector3(_controller.velocity.x, 0.0f, _controller.velocity.z).magnitude;
+                float speedOffset = 0.1f;
+
+                if (currentHorizontalSpeed < targetSpeed - speedOffset || currentHorizontalSpeed > targetSpeed + speedOffset)
+                {
+                    _speed = Mathf.Lerp(currentHorizontalSpeed, targetSpeed, Time.deltaTime * SpeedChangeRate);
+                    _speed = Mathf.Round(_speed * 1000f) / 1000f;
+                }
+                else
+                {
+                    _speed = targetSpeed;
+                }
+                _wallJumping = true;
+                _prevDirection = inputDirection;
+                return inputDirection;
             }
-
-
-            //If moving while touching a wall
+            //Wall run state
             if (_input.move != Vector2.zero && _wallRunDelta >= 0.0f)
             {
                 inputDirection += transform.right * _input.move.x + transform.forward * _input.move.y;
@@ -293,9 +357,26 @@ namespace StarterAssets
                     _verticalVelocity = Mathf.Sqrt(JumpHeight * -1f * Gravity); //Half Jump height
                 }
                 _wallRunDelta -= Time.deltaTime;
+                return inputDirection;
             }
+            else
+                return Vector3.zero;
+        }
 
-            MoveThePlayer(inputDirection.normalized);
+        private Vector3 HandleFallingHoriMovement()
+        {
+            //Set target speed
+            float targetSpeed = _controller.velocity.y <= 0.0f ? MoveSpeed * AirSpeedMultiplier : MoveSpeed;
+            return GeneralHorizontalMovement(targetSpeed);
+        }
+
+        private Vector3 HandleDashHoriMovement()
+        {
+            _input.dash = false;
+            _dashDurationDelta += Time.deltaTime;
+            float targetSpeed = MoveSpeed * DashSpeedMultiplier;
+            return GeneralHorizontalMovement(targetSpeed);
+
         }
 
         private void JumpAndGravity()
@@ -349,64 +430,6 @@ namespace StarterAssets
                 else
                     _verticalVelocity += Gravity * Time.deltaTime * WallSlideMultiplier;
             }
-        }
-
-        private void Dash()
-        {
-            _input.dash = false;
-            if (!_isDashing && _dashTimeoutDelta <= 0.0f)
-            {
-                _dashTimeoutDelta = DashCooldown;
-                _dashDurationDelta = 0f;
-                _isDashing = true;
-            }
-            else if (!_isDashing && _dashTimeoutDelta > 0.0f)
-                return;
-
-            _dashDurationDelta += Time.deltaTime;
-
-            if (_dashDurationDelta > DashDuration)
-                _isDashing = false;
-
-            float targetSpeed = MoveSpeed * DashSpeedMultiplier;
-            // a simplistic acceleration and deceleration designed to be easy to remove, replace, or iterate upon
-
-            // note: Vector2's == operator uses approximation so is not floating point error prone, and is cheaper than magnitude
-
-            // a reference to the players current horizontal velocity
-            float currentHorizontalSpeed = new Vector3(_controller.velocity.x, 0.0f, _controller.velocity.z).magnitude;
-            float speedOffset = 0.1f;
-            float inputMagnitude = _input.analogMovement ? _input.move.magnitude : 1f;
-
-            // accelerate or decelerate to target speed
-            if (currentHorizontalSpeed < targetSpeed - speedOffset || currentHorizontalSpeed > targetSpeed + speedOffset)
-            {
-                // creates curved result rather than a linear one giving a more organic speed change
-                // note T in Lerp is clamped, so we don't need to clamp our speed
-                _speed = Mathf.Lerp(currentHorizontalSpeed, targetSpeed * inputMagnitude, Time.deltaTime * SpeedChangeRate * 100);
-
-                // round speed to 3 decimal places
-                _speed = Mathf.Round(_speed * 1000f) / 1000f;
-            }
-            else
-            {
-                _speed = targetSpeed;
-            }
-
-            // normalise input direction
-            Vector3 inputDirection = new Vector3(_input.move.x, 0.0f, _input.move.y).normalized;
-
-            // note: Vector2's != operator uses approximation so is not floating point error prone, and is cheaper than magnitude
-            // if there is a move input rotate player when the player is moving
-            if (_input.move != Vector2.zero)
-            {
-                // move
-                inputDirection = transform.right * _input.move.x + transform.forward * _input.move.y;
-            }
-
-            // move the player
-            MoveThePlayer(inputDirection.normalized);
-
         }
 
         void MoveThePlayer(Vector3 Direction)
